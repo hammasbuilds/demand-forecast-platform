@@ -158,7 +158,7 @@ rolling_origin(history["lahore"], croston, horizon=4, period=52).summary()
 
 ## Tests
 
-**45 tests (41 core + 4 for the optional Streamlit demo). No dependencies, no fixtures, no data download.**
+**41 tests. No dependencies, no fixtures, no data download.**
 
 | Covered | |
 |---|---|
@@ -198,7 +198,7 @@ git clone https://github.com/hammasbuilds/demand-forecast-platform
 cd demand-forecast-platform
 
 pip install -e .         # zero dependencies to resolve
-pytest -q                # 45 tests, under a second
+pytest -q                # 41 tests, under a second
 ```
 
 ```python
