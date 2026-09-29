@@ -12,9 +12,8 @@
 
 <p align="center">
   <a href="https://github.com/hammasbuilds/demand-forecast-platform/actions/workflows/ci.yml"><img src="https://github.com/hammasbuilds/demand-forecast-platform/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="python">
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="python">
   <img src="https://img.shields.io/badge/core%20deps-zero-success" alt="deps">
-  <img src="https://img.shields.io/badge/stack-pandas%20%C2%B7%20Streamlit-orange" alt="stack">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
 </p>
 
@@ -134,7 +133,7 @@ adds value or launders the seasonality it was handed.
 
 ```python
 compare(series, {"naive": naive, "seasonal": seasonal, "croston": croston})
-# {"seasonal": {"mase": 1.0, ...}, "naive": {"mase": 31.7, "beats_naive": False}}
+# {"seasonal": {"mase": 1.0, ...}, "naive": {"mase": 31.7, "beats_benchmark": False}}
 ```
 
 Seasonal naive scores exactly 1.0 — it *is* the denominator, so it cannot beat itself.
@@ -145,11 +144,15 @@ That is the line any model has to come in under.
 ```python
 h = Hierarchy()
 h.add("total")
-h.add("north", parent="total"); h.add("south", parent="total")
-h.add("lahore", parent="north"); h.add("karachi", parent="south")
+h.add("north", parent="total")
+h.add("south", parent="total")
+h.add("lahore", parent="north")
+h.add("karachi", parent="south")
 
-base = {name: forecast(history[name], horizon=4) for name in h.nodes}
-plan = optimal(h, base)          # coherent everywhere
+# history: one series per node, oldest first - build your own with forecast.io.read_csv,
+# or see "Run it yourself" below for a fully worked, runnable example
+base = {name: naive(history[name], horizon=4) for name in h.nodes}
+plan = optimal(h, base)  # coherent everywhere
 
 assert h.is_coherent(plan)
 
@@ -158,22 +161,26 @@ rolling_origin(history["lahore"], croston, horizon=4, period=52).summary()
 
 ## Tests
 
-**41 tests. No dependencies, no fixtures, no data download.**
+**77 tests. No dependencies, no fixtures, no data download.**
 
 | Covered | |
 |---|---|
 | Hierarchy | structure, levels, duplicate/second-root/unknown-parent rejection, incoherence of independent forecasts |
-| Reconciliation | coherence for every method, leaf and root preservation, weight-0 degeneracy, proportional absorption, deep trees, empty history |
-| Models | naive, seasonal, moving average, drift, Croston on intermittent/single/all-zero demand |
+| Reconciliation | coherence for every method (including `mint_ols`/`mint_wls`), leaf and root preservation, weight-0 degeneracy, proportional absorption, deep trees, empty history |
+| Models | naive, seasonal, moving average, drift, Croston on intermittent/single/all-zero demand, ETS family (`ses`/`holt`/`holt_winters`/`ets`) |
 | Metrics | sMAPE bounds and the 0-vs-0 case, MASE direction, in-sample denominator, flat-series `NaN` |
-| Backtest | **leakage**, expanding window, wrong-length output, mutating forecaster, short series, identical folds |
+| Backtest | **leakage**, expanding window, wrong-length output, mutating forecaster, short series raise instead of silently returning nothing, identical folds, `beats_benchmark` against a real out-of-sample benchmark |
+| Validation | NaN/negative-safe reconciliation, `step`/`horizon`/`alpha` rejected out of range instead of looping or producing garbage |
+| CSV / CLI | column errors named, missing cells filled or refused, `forecast`/`backtest`/`evaluate` end to end |
 
 ## Limits
 
-- `optimal` distributes disagreement proportionally rather than solving the MinT
-  covariance system. It is coherent and it uses every level; it is not provably
-  minimum-variance. The matrix version needs numpy and a covariance estimate that is
-  itself hard to get right on short series.
+- `mint` solves the least-squares reconciliation with a diagonal covariance (OLS or
+  structural-scaling weights), from scratch with its own Cholesky solver - no numpy.
+  `optimal`/`weighted_blend` is the cheaper heuristic instead, for when an m-by-m
+  solve (m = leaves) is more machinery than the disagreement is worth. Like every
+  MinT variant, it can return negative values for a non-negative series when the
+  base forecasts disagree badly enough.
 - Baselines only. Gradient boosting and state-space models fit behind the same
   `Forecaster` signature — but the baselines are what they must be scored against,
   which is why they are here first.
@@ -183,7 +190,7 @@ rolling_origin(history["lahore"], croston, horizon=4, period=52).summary()
 
 ## Keywords
 
-demand forecasting &middot; hierarchical forecasting &middot; forecast reconciliation &middot; intermittent demand &middot; Croston &middot; rolling origin backtest &middot; walk-forward validation &middot; MAPE &middot; sMAPE &middot; MASE &middot; seasonal naive baseline &middot; time series &middot; supply chain &middot; inventory &middot; retail analytics &middot; Online Retail II
+demand forecasting &middot; hierarchical forecasting &middot; forecast reconciliation &middot; intermittent demand &middot; Croston &middot; ETS &middot; exponential smoothing &middot; rolling origin backtest &middot; walk-forward validation &middot; MAPE &middot; sMAPE &middot; MASE &middot; seasonal naive baseline &middot; time series &middot; supply chain &middot; inventory &middot; retail analytics
 
 ## License
 
@@ -197,47 +204,128 @@ MIT
 git clone https://github.com/hammasbuilds/demand-forecast-platform
 cd demand-forecast-platform
 
-pip install -e .         # zero dependencies to resolve
-pytest -q                # 41 tests, under a second
+pip install -e ".[dev]"  # zero runtime dependencies; pytest for development
+pytest -q                # 77 tests, under a second
 ```
 
+Every call below is real and runs as shown:
+
 ```python
-from forecast import Hierarchy, optimal, rolling_origin, compare, croston, naive_seasonal
+import random
+from forecast import Hierarchy, compare, croston, naive, naive_seasonal, optimal
 
 h = Hierarchy()
 h.add("total")
-h.add("north", parent="total"); h.add("south", parent="total")
-h.add("lahore", parent="north"); h.add("karachi", parent="south")
+h.add("north", parent="total")
+h.add("south", parent="total")
+h.add("lahore", parent="north")
+h.add("karachi", parent="south")
 
-base = {name: my_forecast(history[name], horizon=4) for name in h.nodes}
+rng = random.Random(3)
+history = {
+    "lahore": [50 + 10 * rng.random() + (i % 52) for i in range(120)],
+    "karachi": [40 + 8 * rng.random() + (i % 52) for i in range(120)],
+}
+history["north"] = history["lahore"]
+history["south"] = history["karachi"]
+history["total"] = [a + b for a, b in zip(history["lahore"], history["karachi"])]
+
+base = {name: naive(history[name], horizon=4) for name in h.nodes}
 plan = optimal(h, base)
-assert h.is_coherent(plan)          # children sum to parents, exactly
+assert h.is_coherent(plan)  # children sum to parents, exactly
 
-compare(history["lahore"],
-        {"naive": naive, "seasonal": lambda h_, n: naive_seasonal(h_, n, period=52),
-         "croston": croston},
-        horizon=4, period=52)
+compare(
+    history["lahore"],
+    {
+        "naive": naive,
+        "seasonal": lambda hist, n: naive_seasonal(hist, n, period=52),
+        "croston": croston,
+    },
+    horizon=4,
+    period=52,
+)
 ```
+
+### On your own data
+
+```bash
+demand-forecast forecast sales.csv --time week --value sales \
+    --levels region,store --horizon 4 --period 52
+demand-forecast backtest sales.csv --time week --value sales --levels region --json
+```
+
+A long-format CSV in, one row per `(levels..., period)`; a missing `(store, week)` cell
+is filled with 0 by default (`--missing error` to refuse instead). `forecast` defaults
+to `ets` reconciled with `mint_wls`; `--model` and `--method` list every option in
+`--help`.
 
 ### Input / Output
 
-![input](docs/images/input.png)
+`python demo.py`, verbatim (shown as text, not a screenshot, so it never goes stale
+without the tests noticing):
 
-`python demo.py`
+```
+INPUT
+   examples/weekly_sales.csv: 760 rows, 156 weeks (2023-01-02 .. 2025-12-22)
+   8 nodes: total, north, north/islamabad, north/lahore, north/multan, south, south/hyderabad, south/karachi
+   20 store-weeks with no row (north/multan opened late) filled with 0
 
-![output](docs/images/output.png)
+OUTPUT
+1. ETS forecast of every node, 4 weeks ahead
+   coherent as forecast?  False
+      week +1: north + south =   577.8, total says   604.0  (off by -26.2)
+      week +2: north + south =   577.8, total says   613.1  (off by -35.4)
+      week +3: north + south =   580.8, total says   615.5  (off by -34.7)
+      week +4: north + south =   592.9, total says   608.2  (off by -15.3)
 
-Two results, and the second one is a loss.
+   method          coherent  total, weeks +1..+4
+   bottom_up           True    626.8    660.1    669.0    672.8
+   mint_wls            True    602.9    617.0    621.8    624.6
+   weighted_blend      True    603.1    616.0    620.2    620.5
 
-Reconciliation works: independent forecasts disagree with themselves at every level, and
-both `bottom_up` and `optimal` return a set that sums correctly, with `is_coherent`
-asserting it rather than the README claiming it.
+   Which reconciliation is most accurate? 25 rolling origins over year 3, MAE per node, 4 weeks ahead
+   method            total  regions  stores
+   bottom_up         22.54    15.34    8.96
+   mint_wls          25.16    16.70    9.31
+   weighted_blend    25.95    17.02    9.42
+   mint_ols          27.13    17.92    9.67
+   base              29.42    18.36    8.96
+   top_down          29.42    23.86   12.57
+   On this data bottom_up is best at the total; 'base' is the unreconciled forecast.
 
-The intermittent series is the honest half. **Croston does not beat a naive forecast
-here** — MASE 1.192, and all four forecasters score above 1.0, meaning every one of them
-is worse than doing nothing. Croston is merely the least bad. On 29 zero days out of 40
-the right answer is not a better forecaster; it is to stop forecasting the series and
-stock it to a service level instead.
+2. Backtest of the total: 100 rolling origins, 4 weeks ahead, benchmark seasonal_naive(period=52)
+   forecaster          MAE  rel MAE   MASE  beats seasonal naive?
+   holt_winters      31.79    0.851  0.635  yes
+   holt_damped       34.79    0.931  0.722  yes
+   seasonal_naive    37.36    1.000  0.709  no
+   naive             37.50    1.004  0.786  no
+   ses               38.24    1.023  0.804  no
+   rel MAE is MAE divided by seasonal naive's MAE on the same folds. Beating it: holt_damped, holt_winters.
+
+3. Intermittent series: 11 non-zero days out of 40
+      [0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 2, 0, 0, 3, 0, 0, 0, 2, 3, 0, 0, 2, 0, 3, 0, 0, 2, 0, 2, 3, 0, 0]
+   17 rolling origins, 4 days ahead, benchmark naive
+   forecaster          MAE  rel MAE   MASE  beats naive?
+   croston           1.112    0.763  1.192  yes
+   moving_average    1.199    0.823  1.289  yes
+   naive             1.456    1.000  1.559  no
+   drift             1.527    1.049  1.637  no
+   Croston cuts naive's error by 24%, yet its MASE is 1.19:
+   worse than one-step naive *in sample*, the yardstick MASE uses. On a series
+   this sparse, a rate forecast plus a service-level stock is the realistic plan.
+```
+
+Reconciliation works: independent forecasts disagree with themselves at every level (the
+raw ETS forecast is off by 15-35 units per week before reconciliation runs), and every
+method returns a set that sums correctly, with `is_coherent` asserting it rather than the
+README claiming it.
+
+The rolling backtests are the honest half. **On the intermittent series, Croston beats
+naive on MAE (1.11 vs 1.46) but not on MASE (1.19)** — MASE's yardstick is one-step
+naive *in sample*, a stricter bar than the same forecaster scored out of sample, and
+every model here is above 1.0 on it. Croston is the least bad, cutting naive's error by
+24% on MAE; on 29 zero days out of 40 the more honest answer is that this series should
+be stocked to a service level, not forecast at all.
 
 ## Problems hit while building this
 

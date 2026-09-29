@@ -1,96 +1,151 @@
-"""Forecast every level of a hierarchy independently, then make the numbers add up.
+"""Forecast a store hierarchy, make the numbers add up, and check against seasonal naive.
 
     python demo.py
 
-Two things nobody notices until a planner does: independent forecasts of
-`total`, `north` and `south` do not sum to each other, and an intermittent
-series -- a part that sells on 11 days out of 40 -- defeats every ordinary
-forecaster, Croston included. No dependencies, no network.
+Three parts, all on files and code in this repo, no network:
+
+1. examples/weekly_sales.csv (3 years, 2 regions, 5 stores): ETS forecasts of every
+   node, 4 weeks ahead, do not add up; three reconciliation methods make them.
+2. A rolling-origin backtest of the total: does anything beat seasonal naive, out of
+   sample, on the same folds?
+3. An intermittent spare-part series: Croston against the naive benchmark.
 """
 
 import random
 import sys
+from functools import partial
+from pathlib import Path
 
-sys.path.insert(0, "src")
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
 
-from forecast.backtest import compare
-from forecast.hierarchy import Hierarchy, bottom_up, optimal
-from forecast.models import croston, drift, moving_average, naive
+from forecast import (  # noqa: E402
+    backtest_reconciliation,
+    compare,
+    croston,
+    drift,
+    ets,
+    holt,
+    holt_winters,
+    moving_average,
+    naive,
+    naive_seasonal,
+    read_csv,
+    reconcile,
+    ses,
+)
 
-h = Hierarchy()
-h.add("total")
-h.add("north", parent="total")
-h.add("south", parent="total")
-for leaf in ("n1", "n2"):
-    h.add(leaf, parent="north")
-for leaf in ("s1", "s2"):
-    h.add(leaf, parent="south")
+HORIZON = 4
+PERIOD = 52
 
-# What independent, per-series forecasting actually produces: every level modelled
-# on its own history, so no level agrees with any other.
-INDEPENDENT = {
-    "total": 1000.0,
-    "north": 610.0,
-    "south": 440.0,
-    "n1": 300.0,
-    "n2": 290.0,
-    "s1": 250.0,
-    "s2": 205.0,
-}
+data = read_csv(
+    ROOT / "examples" / "weekly_sales.csv", time="week", value="sales", levels=["region", "store"]
+)
+h = data.hierarchy
 
 print("INPUT")
-print("   a 3-level hierarchy, each node forecast independently")
-for name in ("total", "north", "south", "n1", "n2", "s1", "s2"):
-    print(f"      {name:6} {INDEPENDENT[name]:>8.1f}")
+print(
+    f"   examples/weekly_sales.csv: {data.rows} rows, {len(data.periods)} weeks "
+    f"({data.periods[0]} .. {data.periods[-1]})"
+)
+print(f"   {len(h.nodes)} nodes: " + ", ".join(h.nodes))
+print(f"   {data.filled} store-weeks with no row (north/multan opened late) filled with 0")
 print()
+
+# --- 1. reconciliation --------------------------------------------------------------
+base = {node: ets(data.history[node], HORIZON, period=PERIOD) for node in h.nodes}
 
 print("OUTPUT")
-print(f"   coherent as forecast?   {h.is_coherent(INDEPENDENT)}")
-print(
-    f"      north + south = {INDEPENDENT['north'] + INDEPENDENT['south']:.1f}, "
-    f"but total says {INDEPENDENT['total']:.1f}"
-)
-print(
-    f"      n1 + n2       = {INDEPENDENT['n1'] + INDEPENDENT['n2']:.1f}, "
-    f"but north says {INDEPENDENT['north']:.1f}"
-)
-print()
-
-for name, fn in (("bottom_up", bottom_up), ("optimal", optimal)):
-    rec = fn(h, INDEPENDENT)
+print(f"1. ETS forecast of every node, {HORIZON} weeks ahead")
+print(f"   coherent as forecast?  {h.is_coherent(base)}")
+for step in range(HORIZON):
+    kids = base["north"][step] + base["south"][step]
     print(
-        f"   {name:10} coherent={h.is_coherent(rec)}   "
-        f"total={rec['total']:.1f}  north={rec['north']:.1f}  south={rec['south']:.1f}"
+        f"      week +{step + 1}: north + south = {kids:7.1f}, total says "
+        f"{base['total'][step]:7.1f}  (off by {kids - base['total'][step]:+.1f})"
     )
 print()
+print(f"   {'method':15} {'coherent':>8}  total, weeks +1..+{HORIZON}")
+for method in ("bottom_up", "mint_wls", "weighted_blend"):
+    rec = reconcile(h, base, method)
+    totals = "  ".join(f"{v:7.1f}" for v in rec["total"])
+    print(f"   {method:15} {h.is_coherent(rec)!s:>8}  {totals}")
+print()
 
-# --- intermittent demand -----------------------------------------------------
+# Coherent is not the same as accurate. Which method is closest to what happened?
+ev = backtest_reconciliation(
+    h,
+    data.history,
+    partial(ets, period=PERIOD),
+    horizon=HORIZON,
+    period=PERIOD,
+    initial=2 * PERIOD,
+    step=2,
+)
+print(
+    f"   Which reconciliation is most accurate? {ev['folds']} rolling origins over year 3, "
+    f"MAE per node, {HORIZON} weeks ahead"
+)
+print(f"   {'method':15} {'total':>7} {'regions':>8} {'stores':>7}")
+ranked = sorted(ev["methods"].items(), key=lambda kv: kv[1]["mae_by_level"][0])
+for method, r in ranked:
+    top, mid, leaf = r["mae_by_level"]
+    print(f"   {method:15} {top:7.2f} {mid:8.2f} {leaf:7.2f}")
+best = ranked[0][0]
+print(f"   On this data {best} is best at the total; 'base' is the unreconciled forecast.")
+print()
+
+# --- 2. does anything beat seasonal naive? ------------------------------------------
+models = {
+    "seasonal_naive": partial(naive_seasonal, period=PERIOD),
+    "naive": naive,
+    "ses": ses,
+    "holt_damped": partial(holt, damped=True),
+    "holt_winters": partial(holt_winters, period=PERIOD),
+}
+scores = compare(data.history["total"], models, horizon=HORIZON, period=PERIOD)
+first = next(iter(scores.values()))
+print(
+    f"2. Backtest of the total: {first['folds']} rolling origins, {HORIZON} weeks ahead, "
+    f"benchmark {first['benchmark']}"
+)
+print(f"   {'forecaster':15} {'MAE':>7} {'rel MAE':>8} {'MASE':>6}  beats seasonal naive?")
+for name, s in sorted(scores.items(), key=lambda kv: kv[1]["relative_mae"]):
+    print(
+        f"   {name:15} {s['mae']:7.2f} {s['relative_mae']:8.3f} {s['mase']:6.3f}  "
+        f"{'yes' if s['beats_benchmark'] else 'no'}"
+    )
+winners = [n for n, s in scores.items() if s["beats_benchmark"]]
+print(
+    "   rel MAE is MAE divided by seasonal naive's MAE on the same folds. "
+    f"Beating it: {', '.join(winners) or 'nothing'}."
+)
+print()
+
+# --- 3. intermittent demand ---------------------------------------------------------
 rng = random.Random(3)
 spare_part = [rng.choice([0, 0, 0, 0, 0, 2, 3]) for _ in range(40)]
 nonzero = sum(1 for v in spare_part if v)
-
-print(f"   an intermittent series: {nonzero} non-zero days out of {len(spare_part)}")
+print(f"3. Intermittent series: {nonzero} non-zero days out of {len(spare_part)}")
 print(f"      {spare_part}")
-print()
 results = compare(
     spare_part,
-    {
-        "naive": naive,
-        "moving_average": moving_average,
-        "drift": drift,
-        "croston": croston,
-    },
-    horizon=4,
+    {"croston": croston, "moving_average": moving_average, "naive": naive, "drift": drift},
+    horizon=HORIZON,
     initial=20,
 )
-print(f"   {'forecaster':16} {'MASE':>8}  {'beats doing nothing?':>20}")
-print("   " + "-" * 50)
-for name, stats in sorted(results.items(), key=lambda kv: kv[1]["mase"]):
-    print(f"   {name:16} {stats['mase']:>8.3f}  {str(stats['beats_naive']):>20}")
-print()
-print("   MASE below 1.0 beats a naive forecast. Above 1.0 is worse than")
-print("   doing nothing, and all four are above 1.0.")
-print("   Croston is built for intermittent demand and is the least bad of")
-print("   the four -- but on 29 zero days out of 40 it still loses to naive.")
-print("   The honest output here is that this series should not be forecast")
-print("   at all; it should be stocked to a service level.")
+first = next(iter(results.values()))
+print(f"   {first['folds']} rolling origins, {HORIZON} days ahead, benchmark {first['benchmark']}")
+print(f"   {'forecaster':15} {'MAE':>7} {'rel MAE':>8} {'MASE':>6}  beats naive?")
+for name, s in sorted(results.items(), key=lambda kv: kv[1]["relative_mae"]):
+    print(
+        f"   {name:15} {s['mae']:7.3f} {s['relative_mae']:8.3f} {s['mase']:6.3f}  "
+        f"{'yes' if s['beats_benchmark'] else 'no'}"
+    )
+c = results["croston"]
+print(
+    f"   Croston cuts naive's error by {100 * (1 - c['relative_mae']):.0f}%, yet its MASE is "
+    f"{c['mase']:.2f}:"
+)
+print("   worse than one-step naive *in sample*, the yardstick MASE uses. On a series")
+print("   this sparse, a rate forecast plus a service-level stock is the realistic plan.")
