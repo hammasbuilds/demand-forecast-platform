@@ -2,35 +2,44 @@
 
 The problem, which is easy to state and easy to get wrong:
 
-    total = 1000        ← forecast independently
-      north = 400       ← forecast independently
-      south = 550       ← forecast independently
+    total = 1000        <- forecast independently
+      north = 400       <- forecast independently
+      south = 550       <- forecast independently
 
-400 + 550 = 950 ≠ 1000. The regional plans and the national plan disagree by 50 units,
-and every downstream decision — procurement, staffing, cash — is now made against one
-of two numbers that cannot both be right.
+400 + 550 = 950, not 1000. The regional plan and the national plan disagree by 50
+units, and procurement, staffing and cash are now planned against two numbers that
+cannot both be right. **Reconciliation** adjusts the forecasts so they add up.
 
-Forecasting each level separately always produces this, because each level is fitted
-to its own noise. **Reconciliation** adjusts the forecasts so they add up. Coherence is
-an exact arithmetic property, which makes it one of the rare machine-learning
-behaviours that can be asserted rather than measured.
+Every method here takes `base` as either one number per node (a single step) or one
+equal-length list per node (a multi-step forecast, reconciled step by step), and
+returns the same shape. Base forecasts are validated: an unknown node name (a typo),
+a missing required node, NaN or a mix of scalars and lists raises HierarchyError
+instead of being read as zero.
 
-Three methods, each correct for a different situation:
-
-  bottom-up   Forecast the leaves, sum upward. Coherent by construction. Best when
-              the leaves have enough signal to forecast; worst when they are sparse
-              and noisy, because the noise sums too.
-  top-down    Forecast the total, split by historical proportions. Best when the total
-              is stable and the leaves are sparse; it cannot represent a leaf whose
-              share is changing.
-  optimal     Keep every level's forecast and distribute the disagreement. Better than
-              either when both levels carry real information.
+  bottom_up       Sum the leaves upward. Coherent by construction; ignores every
+                  forecast above leaf level.
+  top_down        Split the root by per-leaf proportions (e.g. historical shares).
+                  Cannot represent a leaf whose share is changing.
+  mint            MinT-family least squares (Wickramasuriya et al. 2019) with a
+                  diagonal covariance: `ols` (identity) or `wls_struct` (each node
+                  weighted by its leaf count). The closest-to-base coherent forecast
+                  in that metric. No covariance estimate from residuals (`mint_shrink`
+                  needs numpy-scale linear algebra), so it is not the full MinT.
+  weighted_blend  Heuristic: blend each parent with its children's sum bottom-up, then
+                  push the disagreement down top-down. Coherent, uses every level, not
+                  optimal in any statistical sense. `optimal` is its old name.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import difflib
+import math
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from numbers import Real
+from typing import Any
+
+Values = Mapping[str, Any]
 
 
 class HierarchyError(ValueError):
@@ -52,24 +61,61 @@ class Hierarchy:
     root: str = ""
 
     def add(self, name: str, *, parent: str | None = None) -> Node:
+        if not isinstance(name, str) or not name:
+            raise HierarchyError(f"node name must be a non-empty string, got {name!r}")
         if name in self.nodes:
             raise HierarchyError(f"{name!r} already in the hierarchy")
-        node = Node(name=name, parent=parent)
-        self.nodes[name] = node
         if parent is None:
             if self.root:
                 raise HierarchyError(f"hierarchy already has root {self.root!r}")
+        elif parent not in self.nodes:
+            raise HierarchyError(f"unknown parent {parent!r}")
+        node = Node(name=name, parent=parent)
+        self.nodes[name] = node
+        if parent is None:
             self.root = name
         else:
-            if parent not in self.nodes:
-                raise HierarchyError(f"unknown parent {parent!r}")
             self.nodes[parent].children.append(name)
         return node
+
+    @classmethod
+    def from_paths(
+        cls, paths: Iterable[Sequence[str]], *, root: str = "total", sep: str = "/"
+    ) -> Hierarchy:
+        """Build a tree from level paths such as `("north", "lahore")`.
+
+        Node names are the path joined by `sep` ("north", "north/lahore"), so two
+        stores with the same name in different regions stay distinct. An empty path
+        list gives a single-node hierarchy (just the root).
+        """
+        h = cls()
+        h.add(root)
+        for path in paths:
+            parent = root
+            for depth in range(len(path)):
+                part = str(path[depth])
+                if not part:
+                    raise HierarchyError(f"empty level value in path {tuple(path)!r}")
+                name = sep.join(str(p) for p in path[: depth + 1])
+                if name == root:
+                    raise HierarchyError(f"level value {name!r} collides with the root name")
+                if name not in h.nodes:
+                    h.add(name, parent=parent)
+                elif h.nodes[name].parent != parent:
+                    raise HierarchyError(f"{name!r} appears under two parents")
+                parent = name
+        return h
+
+    def _require_root(self) -> None:
+        if not self.root:
+            raise HierarchyError("the hierarchy is empty; add a root node first")
 
     def leaves(self) -> list[str]:
         return [n.name for n in self.nodes.values() if not n.children]
 
     def descendant_leaves(self, name: str) -> list[str]:
+        if name not in self.nodes:
+            raise HierarchyError(f"unknown node {name!r}")
         node = self.nodes[name]
         if not node.children:
             return [name]
@@ -90,135 +136,376 @@ class Hierarchy:
             current = nxt
         return out
 
-    def is_coherent(self, values: dict[str, float], *, tolerance: float = 1e-6) -> bool:
-        """Does every parent equal the sum of its children?"""
+    def aggregate(self, leaf_values: Values) -> dict[str, Any]:
+        """Sum leaf values (scalars or equal-length lists) up to every node."""
+        return bottom_up(self, leaf_values)
+
+    def is_coherent(self, values: Values, *, tolerance: float = 1e-6) -> bool:
+        """Does every parent equal the sum of its children, at every step?
+
+        `tolerance` is relative to the parent's magnitude (absolute below 1.0). NaN
+        anywhere is incoherent. Unknown or missing node names raise HierarchyError: a
+        coherence check on the wrong keys is not a check.
+        """
+        self._require_root()
+        table, _, _ = _normalize(self, values, required=set(self.nodes), allow_nan=True)
         for name, node in self.nodes.items():
-            if not node.children:
-                continue
-            total = sum(values.get(c, 0.0) for c in node.children)
-            if abs(values.get(name, 0.0) - total) > tolerance:
-                return False
+            for step, own in enumerate(table[name]):
+                if math.isnan(own):
+                    return False
+                if not node.children:
+                    continue
+                total = sum(table[c][step] for c in node.children)
+                if math.isnan(total) or abs(own - total) > tolerance * max(1.0, abs(own)):
+                    return False
         return True
 
 
-# --- reconciliation ---------------------------------------------------------------
+# --- input validation ---------------------------------------------------------------
 
 
-def bottom_up(hierarchy: Hierarchy, base: dict[str, float]) -> dict[str, float]:
-    """Sum the leaves upward. Coherent by construction, and it discards every
-    forecast made above leaf level."""
+def _suggest(name: str, choices: Iterable[str]) -> str:
+    choices = list(choices)
+    folded = [c for c in choices if c.casefold() == name.casefold()]
+    close = folded or difflib.get_close_matches(name, choices, n=1)
+    return f" (did you mean {close[0]!r}?)" if close else ""
+
+
+def _number(value: Any, where: str, *, allow_nan: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise HierarchyError(f"{where} is {value!r}, not a number")
+    f = float(value)
+    if math.isnan(f) and allow_nan:
+        return f
+    if not math.isfinite(f):
+        raise HierarchyError(f"{where} is {value!r}; forecasts must be finite numbers")
+    return f
+
+
+def _normalize(
+    h: Hierarchy, values: Values, *, required: set[str], allow_nan: bool = False
+) -> tuple[dict[str, list[float]], int, bool]:
+    """Validate `values` against `h` and return (per-node lists, horizon, was_scalar)."""
+    if not isinstance(values, Mapping):
+        raise HierarchyError(f"expected a dict of node -> forecast, got {type(values).__name__}")
+    unknown = [k for k in values if k not in h.nodes]
+    if unknown:
+        k = unknown[0]
+        raise HierarchyError(f"{k!r} is not a node in the hierarchy{_suggest(str(k), h.nodes)}")
+    missing = sorted(required - set(values))
+    if missing:
+        shown = ", ".join(repr(m) for m in missing[:5])
+        more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+        raise HierarchyError(f"no forecast for {shown}{more}")
+
+    kinds = {isinstance(v, Sequence) and not isinstance(v, (str, bytes)) for v in values.values()}
+    if len(kinds) > 1:
+        raise HierarchyError("mix of single numbers and lists; give every node the same shape")
+    scalar = not kinds or kinds == {False}
+    table: dict[str, list[float]] = {}
+    horizon = 1
+    if scalar:
+        for k, v in values.items():
+            table[k] = [_number(v, f"forecast for {k!r}", allow_nan=allow_nan)]
+    else:
+        lengths = {len(v) for v in values.values()}
+        if len(lengths) != 1 or 0 in lengths:
+            raise HierarchyError(
+                f"every node needs the same number of steps (>= 1); got lengths {sorted(lengths)}"
+            )
+        horizon = lengths.pop()
+        for k, v in values.items():
+            table[k] = [
+                _number(x, f"forecast for {k!r} step {i}", allow_nan=allow_nan)
+                for i, x in enumerate(v)
+            ]
+    return table, horizon, scalar
+
+
+def _shape(table: dict[str, list[float]], scalar: bool) -> dict[str, Any]:
+    return {k: (v[0] if scalar else v) for k, v in table.items()}
+
+
+def _per_step(h: Hierarchy, table: dict[str, list[float]], horizon: int, fn) -> dict:
+    out: dict[str, list[float]] = {name: [] for name in h.nodes}
+    for step in range(horizon):
+        one = {k: v[step] for k, v in table.items()}
+        for k, v in fn(one).items():
+            out[k].append(v)
+    return out
+
+
+# --- reconciliation -----------------------------------------------------------------
+
+
+def _bottom_up_1(h: Hierarchy, leaf: Mapping[str, float]) -> dict[str, float]:
     out: dict[str, float] = {}
 
     def value(name: str) -> float:
-        node = hierarchy.nodes[name]
-        if not node.children:
-            out[name] = float(base.get(name, 0.0))
-        else:
-            out[name] = sum(value(c) for c in node.children)
+        node = h.nodes[name]
+        out[name] = leaf[name] if not node.children else sum(value(c) for c in node.children)
         return out[name]
 
-    value(hierarchy.root)
+    value(h.root)
     return out
 
 
-def top_down(
-    hierarchy: Hierarchy, base: dict[str, float], proportions: dict[str, float]
-) -> dict[str, float]:
-    """Split the root forecast by historical proportions.
+def bottom_up(hierarchy: Hierarchy, base: Values) -> dict[str, Any]:
+    """Sum the leaves upward. Needs a forecast for every leaf; forecasts given for
+    internal nodes are accepted and ignored."""
+    hierarchy._require_root()
+    table, horizon, scalar = _normalize(hierarchy, base, required=set(hierarchy.leaves()))
+    out = _per_step(hierarchy, table, horizon, lambda one: _bottom_up_1(hierarchy, one))
+    return _shape(out, scalar)
 
-    Proportions are of the *root*, per leaf, and must sum to 1. Requiring leaf-level
-    proportions rather than level-by-level shares avoids compounding rounding error
-    down a deep tree.
+
+def top_down(hierarchy: Hierarchy, base: Values, proportions: Mapping[str, float]) -> dict:
+    """Split the root forecast by per-leaf proportions of the root.
+
+    `proportions` must name every leaf and nothing else, be non-negative, and sum to
+    a positive number (they are renormalised to 1). `historical_proportions` builds
+    them from history. Only the root forecast is used.
     """
+    hierarchy._require_root()
     leaves = hierarchy.leaves()
-    total_share = sum(proportions.get(leaf, 0.0) for leaf in leaves)
+    leaf_set = set(leaves)
+    bad = [k for k in proportions if k not in leaf_set]
+    if bad:
+        raise HierarchyError(
+            f"proportion for {bad[0]!r}, which is not a leaf{_suggest(str(bad[0]), leaves)}"
+        )
+    missing = [leaf for leaf in leaves if leaf not in proportions]
+    if missing:
+        raise HierarchyError(f"no proportion for leaf {missing[0]!r}")
+    props = {k: _number(v, f"proportion for {k!r}") for k, v in proportions.items()}
+    negative = [k for k, v in props.items() if v < 0]
+    if negative:
+        raise HierarchyError(f"proportion for {negative[0]!r} is negative")
+    total_share = sum(props.values())
     if total_share <= 0:
         raise HierarchyError("proportions must sum to a positive number")
 
-    root_value = float(base.get(hierarchy.root, 0.0))
-    leaf_values = {leaf: root_value * proportions.get(leaf, 0.0) / total_share for leaf in leaves}
-    return bottom_up(hierarchy, leaf_values)
+    table, horizon, scalar = _normalize(hierarchy, base, required={hierarchy.root})
+    root = table[hierarchy.root]
+    leaf_table = {leaf: [r * props[leaf] / total_share for r in root] for leaf in leaves}
+    out = _per_step(hierarchy, leaf_table, horizon, lambda one: _bottom_up_1(hierarchy, one))
+    return _shape(out, scalar)
 
 
 def historical_proportions(
-    hierarchy: Hierarchy, history: dict[str, Sequence[float]]
+    hierarchy: Hierarchy, history: Mapping[str, Sequence[float]]
 ) -> dict[str, float]:
-    """Each leaf's average share of the root over the observed history."""
+    """Each leaf's share of the summed history. Needs every leaf's history.
+
+    With no history at all (every sum zero) the split is equal: the only defensible
+    default. A leaf whose history sums negative raises, since a negative share of the
+    total is not a proportion.
+    """
+    from .models import clean_series
+
+    hierarchy._require_root()
     leaves = hierarchy.leaves()
-    totals = {leaf: sum(history.get(leaf, [])) for leaf in leaves}
+    unknown = [k for k in history if k not in hierarchy.nodes]
+    if unknown:
+        raise HierarchyError(
+            f"{unknown[0]!r} is not a node in the hierarchy{_suggest(str(unknown[0]), leaves)}"
+        )
+    missing = [leaf for leaf in leaves if leaf not in history]
+    if missing:
+        raise HierarchyError(f"no history for leaf {missing[0]!r}")
+    totals = {leaf: sum(clean_series(history[leaf], name=f"history[{leaf!r}]")) for leaf in leaves}
+    negative = [k for k, v in totals.items() if v < 0]
+    if negative:
+        raise HierarchyError(f"history for {negative[0]!r} sums to {totals[negative[0]]}")
     grand = sum(totals.values())
     if grand <= 0:
-        # No history to apportion by: an equal split is the only defensible default,
-        # and it is better than dividing by zero or silently returning nothing.
-        return {leaf: 1.0 / len(leaves) for leaf in leaves} if leaves else {}
+        return {leaf: 1.0 / len(leaves) for leaf in leaves}
     return {leaf: totals[leaf] / grand for leaf in leaves}
 
 
-def optimal(
-    hierarchy: Hierarchy, base: dict[str, float], *, weights: dict[str, float] | None = None
-) -> dict[str, float]:
-    """Distribute each parent's disagreement across its children, proportionally.
+def _cholesky_solver(a: list[list[float]]):
+    """Factor a symmetric positive-definite matrix; return a solve(b) function."""
+    n = len(a)
+    lower = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1):
+            s = a[i][j] - sum(lower[i][k] * lower[j][k] for k in range(j))
+            if i == j:
+                if s <= 0:
+                    raise HierarchyError("reconciliation matrix is not positive definite")
+                lower[i][i] = math.sqrt(s)
+            else:
+                lower[i][j] = s / lower[j][j]
 
-    This is the practical core of optimal reconciliation without the matrix algebra:
-    a parent whose children disagree with it pushes the difference down, split by the
-    children's own forecast magnitudes, so a large child absorbs more of the
-    adjustment than a small one. Applied top-down, the result is coherent everywhere.
+    def solve(b: list[float]) -> list[float]:
+        y = [0.0] * n
+        for i in range(n):
+            y[i] = (b[i] - sum(lower[i][k] * y[k] for k in range(i))) / lower[i][i]
+        x = [0.0] * n
+        for i in reversed(range(n)):
+            x[i] = (y[i] - sum(lower[k][i] * x[k] for k in range(i + 1, n))) / lower[i][i]
+        return x
 
-    `weights` lets a level be trusted more or less — a weight of 0 on a node means its
-    own forecast is ignored and it simply takes the sum of its children.
+    return solve
 
-    Two passes, and the order is the whole trick. A single top-down pass cannot work:
-    adjusting a level overwrites the value its own parent just fixed, so every level
-    silently breaks the one above it.
 
-        1. bottom-up   blend each node's own forecast with its children's sum, so
-                       information from every level reaches the root
-        2. top-down    fix the root, then scale each node's children to match it,
-                       preserving the relative proportions the blend produced
+def mint(hierarchy: Hierarchy, base: Values, *, method: str = "wls_struct") -> dict[str, Any]:
+    """Least-squares reconciliation, MinT with a diagonal covariance.
 
-    After pass 2 every parent equals the sum of its children exactly, by construction.
+    Finds leaf values `b` minimising `sum_i (base_i - (S b)_i)^2 / w_i` over every
+    node `i`, where `(S b)_i` is node i's sum of leaves; the result `S b` is coherent.
+
+      method="ols"         w_i = 1 for every node
+      method="wls_struct"  w_i = number of leaves under node i, so an aggregate's
+                           error is expected to be as large as the sum of its parts'
+
+    Needs a forecast for every node. Solves an m-by-m system (m = number of leaves)
+    once, then each step is a triangular solve: fine for hundreds of leaves, slow for
+    tens of thousands. Like every MinT variant it can return negative values for a
+    non-negative series when the base forecasts disagree badly.
     """
-    weights = weights or {}
+    hierarchy._require_root()
+    if method not in ("ols", "wls_struct"):
+        raise HierarchyError(f"method must be 'ols' or 'wls_struct', got {method!r}")
+    table, horizon, scalar = _normalize(hierarchy, base, required=set(hierarchy.nodes))
+    leaves = hierarchy.leaves()
+    index = {leaf: j for j, leaf in enumerate(leaves)}
+    under = {
+        name: [index[x] for x in hierarchy.descendant_leaves(name)] for name in hierarchy.nodes
+    }
+    weight = {name: (1.0 if method == "ols" else float(len(under[name]))) for name in under}
+
+    m = len(leaves)
+    a = [[0.0] * m for _ in range(m)]
+    for name, cols in under.items():
+        inv = 1.0 / weight[name]
+        for j in cols:
+            row = a[j]
+            for k in cols:
+                row[k] += inv
+    solve = _cholesky_solver(a)
+
+    out: dict[str, list[float]] = {name: [] for name in hierarchy.nodes}
+    for step in range(horizon):
+        b = [0.0] * m
+        for name, cols in under.items():
+            contribution = table[name][step] / weight[name]
+            for j in cols:
+                b[j] += contribution
+        x = solve(b)
+        for name, cols in under.items():
+            out[name].append(sum(x[j] for j in cols))
+    return _shape(out, scalar)
+
+
+def _blend_1(
+    h: Hierarchy, base: Mapping[str, float], weights: Mapping[str, float]
+) -> dict[str, float]:
     blended: dict[str, float] = {}
 
     def blend(name: str) -> float:
-        node = hierarchy.nodes[name]
-        own = float(base.get(name, 0.0))
+        node = h.nodes[name]
         if not node.children:
-            blended[name] = own
-            return own
-
+            blended[name] = base[name]
+            return blended[name]
         child_total = sum(blend(c) for c in node.children)
-        parent_weight = weights.get(name, 1.0)
+        w = weights.get(name, 1.0)
         # Weight 0 means the node's own forecast is ignored: it becomes its children.
-        blended[name] = (
-            child_total
-            if parent_weight <= 0
-            else (parent_weight * own + child_total) / (parent_weight + 1)
-        )
+        blended[name] = child_total if w == 0 else (w * base[name] + child_total) / (w + 1)
         return blended[name]
 
-    blend(hierarchy.root)
-
-    out: dict[str, float] = {hierarchy.root: blended[hierarchy.root]}
+    blend(h.root)
+    out: dict[str, float] = {h.root: blended[h.root]}
 
     def distribute(name: str) -> None:
-        children = hierarchy.nodes[name].children
+        children = h.nodes[name].children
         if not children:
             return
-        child_total = sum(blended[c] for c in children)
-        if child_total == 0:
-            # Nothing to apportion by. An equal split keeps the level coherent, which
-            # is better than leaving it inconsistent or dividing by zero.
-            share = out[name] / len(children)
-            for c in children:
-                out[c] = share
-        else:
+        values = [blended[c] for c in children]
+        child_total = sum(values)
+        same_sign = all(v >= 0 for v in values) or all(v <= 0 for v in values)
+        if same_sign and child_total != 0:
+            # Proportional: a large child absorbs more of the adjustment than a small one.
             scale = out[name] / child_total
             for c in children:
                 out[c] = blended[c] * scale
+        else:
+            # Mixed signs (net sales with a store in net returns) or all zero: a
+            # proportional scale would divide by a near-zero net total and explode.
+            # Spread the difference additively, in proportion to each child's size.
+            diff = out[name] - child_total
+            magnitude = sum(abs(v) for v in values)
+            for c, v in zip(children, values, strict=True):
+                share = abs(v) / magnitude if magnitude else 1 / len(children)
+                out[c] = v + diff * share
         for c in children:
             distribute(c)
 
-    distribute(hierarchy.root)
+    distribute(h.root)
     return out
+
+
+def weighted_blend(
+    hierarchy: Hierarchy, base: Values, *, weights: Mapping[str, float] | None = None
+) -> dict[str, Any]:
+    """Blend every level's forecast, then distribute the disagreement. A heuristic.
+
+    Pass 1 (bottom-up): each internal node becomes `(w * own + children_sum) / (w + 1)`,
+    so information from every level reaches the root. Pass 2 (top-down): fix the root,
+    then scale each node's children to match their parent, preserving the blend's
+    proportions (additively when the children have mixed signs). The order matters: a
+    single top-down pass overwrites the value each node's parent just fixed.
+
+    `weights` (default 1.0 per internal node) says how much to trust a node's own
+    forecast; 0 ignores it, which makes the whole method exactly `bottom_up`. Needs a
+    forecast for every leaf and every internal node with non-zero weight.
+    """
+    hierarchy._require_root()
+    weights = dict(weights or {})
+    for k, v in weights.items():
+        if k not in hierarchy.nodes:
+            raise HierarchyError(
+                f"weight for unknown node {k!r}{_suggest(str(k), hierarchy.nodes)}"
+            )
+        if _number(v, f"weight for {k!r}") < 0:
+            raise HierarchyError(f"weight for {k!r} is negative")
+    required = {
+        name
+        for name, node in hierarchy.nodes.items()
+        if not node.children or weights.get(name, 1.0) > 0
+    }
+    table, horizon, scalar = _normalize(hierarchy, base, required=required)
+    for name in hierarchy.nodes:
+        table.setdefault(name, [0.0] * horizon)  # weight-0 nodes: value is never read
+    out = _per_step(hierarchy, table, horizon, lambda one: _blend_1(hierarchy, one, weights))
+    return _shape(out, scalar)
+
+
+# Kept for code written against 0.1.0. The method is a heuristic blend, not MinT.
+optimal = weighted_blend
+
+METHODS = ("bottom_up", "top_down", "mint_ols", "mint_wls", "weighted_blend")
+
+
+def reconcile(
+    hierarchy: Hierarchy,
+    base: Values,
+    method: str,
+    *,
+    history: Mapping[str, Sequence[float]] | None = None,
+) -> dict[str, Any]:
+    """Dispatch by name, for configs and the CLI. `top_down` needs `history`."""
+    if method == "bottom_up":
+        return bottom_up(hierarchy, base)
+    if method == "top_down":
+        if history is None:
+            raise HierarchyError("top_down needs history to compute proportions")
+        leaf_history = {leaf: history[leaf] for leaf in hierarchy.leaves() if leaf in history}
+        return top_down(hierarchy, base, historical_proportions(hierarchy, leaf_history))
+    if method == "mint_ols":
+        return mint(hierarchy, base, method="ols")
+    if method == "mint_wls":
+        return mint(hierarchy, base, method="wls_struct")
+    if method in ("weighted_blend", "optimal"):
+        return weighted_blend(hierarchy, base)
+    raise HierarchyError(f"unknown method {method!r}; choose from {', '.join(METHODS)}")
