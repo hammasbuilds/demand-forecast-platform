@@ -12,6 +12,7 @@ import math
 import pytest
 
 from forecast.backtest import (
+    BacktestError,
     compare,
     mase,
     naive_scale,
@@ -252,8 +253,11 @@ class TestBacktest:
 
         assert rolling_origin(series, vandal, horizon=4, initial=10).summary()["folds"] > 1
 
-    def test_a_series_too_short_to_backtest_yields_nothing(self):
-        assert rolling_origin([1, 2, 3], naive, horizon=4).summary()["folds"] == 0
+    def test_a_series_too_short_to_backtest_raises_instead_of_a_silent_empty_result(self):
+        # A caller that reads .summary()["folds"] without checking it is 0 would
+        # otherwise report every metric on this as if it meant something.
+        with pytest.raises(BacktestError, match="one fold needs"):
+            rolling_origin([1, 2, 3], naive, horizon=4)
 
     def test_seasonal_naive_beats_naive_on_seasonal_data(self):
         """The comparison the project exists to make — before reaching for anything
@@ -283,7 +287,9 @@ class TestBacktest:
         # model worth deploying has to come in under this line.
         assert scores["seasonal"]["mase"] == pytest.approx(1.0, abs=0.01)
         assert scores["naive"]["mase"] > 1.0
-        assert scores["naive"]["beats_naive"] is False
+        # Each model's own default benchmark (seasonal naive, since period=4 was
+        # passed) beats plain naive on data that actually has a season.
+        assert scores["naive"]["beats_benchmark"] is False
 
     def test_all_forecasters_are_scored_on_identical_folds(self):
         """Otherwise the comparison measures the split rather than the models."""
