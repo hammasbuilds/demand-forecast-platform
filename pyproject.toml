@@ -1,7 +1,7 @@
 [project]
 name = "demand-forecast-platform"
-version = "0.1.0"
-description = "Hierarchical demand forecasting: reconciliation, intermittent demand, leakage-free rolling-origin backtesting."
+version = "0.2.0"
+description = "Hierarchical demand forecasting: multi-step reconciliation (bottom-up, top-down, MinT OLS/WLS), Croston, additive ETS, and a leakage-free rolling-origin backtest against seasonal naive. Standard library only."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -9,8 +9,15 @@ license = { text = "MIT" }
 # backtest is a loop; the dependency would exceed the code.
 dependencies = []
 
+# `pip install -e ".[dev]"` reads this; `uv sync` reads the group below. Same list.
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+
 [dependency-groups]
 dev = ["pytest>=8.3", "ruff>=0.8"]
+
+[project.scripts]
+demand-forecast = "forecast.cli:main"
 
 [build-system]
 requires = ["hatchling"]
