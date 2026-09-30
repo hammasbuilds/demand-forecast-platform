@@ -2,12 +2,11 @@
 <p align="center"><i>Hierarchical forecasting where the numbers add up, and a backtest that cannot lie to you</i></p>
 
 <p align="center">
-  <a href="#the-problem-nobody-mentions-in-the-tutorial">The problem</a> &middot;
+  <a href="#what-it-does">The problem</a> &middot;
   <a href="#intermittent-demand">Intermittent demand</a> &middot;
   <a href="#the-backtest-cannot-leak">The backtest</a> &middot;
-  <a href="#mape-is-the-wrong-metric-and-it-is-the-industry-default">MAPE</a> &middot;
-  <a href="#does-anything-beat-seasonal-naive">Does anything beat naive?</a> &middot;
-  <a href="#problems-hit-while-building-this">Problems hit</a>
+  <a href="#on-mape">MAPE</a> &middot;
+  <a href="#does-anything-beat-seasonal-naive">Does anything beat naive?</a> 
 </p>
 
 <p align="center">
@@ -19,7 +18,7 @@
 
 ---
 
-## The problem nobody mentions in the tutorial
+## What it does
 
 ```mermaid
 flowchart LR
@@ -103,7 +102,7 @@ def test_the_forecaster_never_sees_the_future():
 A forecaster that mutates its input also cannot corrupt later folds — it gets a copy.
 That too is a test.
 
-## MAPE is the wrong metric, and it is the industry default
+## On MAPE
 
 MAPE divides by the actual value, so a zero makes it infinite and a near-zero makes it
 enormous. Intermittent demand is *full* of zeros — MAPE reports nonsense exactly where
@@ -326,23 +325,3 @@ naive *in sample*, a stricter bar than the same forecaster scored out of sample,
 every model here is above 1.0 on it. Croston is the least bad, cutting naive's error by
 24% on MAE; on 29 zero days out of 40 the more honest answer is that this series should
 be stocked to a service level, not forecast at all.
-
-## Problems hit while building this
-
-**Optimal reconciliation was not actually coherent.** Distributing each parent's
-disagreement to its children in a single top-down pass looks obviously right and is
-wrong: adjusting a level overwrites the value its own parent just fixed, so every level
-silently breaks the one above it. The output looked plausible and did not add up.
-*Fixed* with two passes — blend bottom-up, then distribute top-down — and coherence is
-asserted for every method rather than assumed.
-
-**A knob that did nothing.** Setting every weight to zero was supposed to reduce
-`optimal` to plain bottom-up. It did not, until the two-pass fix. There is now a test
-asserting the degenerate case matches exactly, because a parameter that does not do what
-it claims is worse than no parameter.
-
-**A test expectation was wrong rather than the code.** MASE's denominator *is* seasonal
-naive, so seasonal naive scores exactly 1.0 and cannot beat itself — my assertion that
-it would `beat_naive` was a misunderstanding of the metric. The corrected test asserts
-`mase == 1.0` for the benchmark and `> 1` for plain naive, which says considerably more
-about what the number means.
