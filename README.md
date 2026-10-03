@@ -130,13 +130,32 @@ The question that decides whether a forecasting project is worth doing. In retai
 answer is frequently *no*, and a team that never checked cannot tell whether its model
 adds value or launders the seasonality it was handed.
 
-```python
-compare(series, {"naive": naive, "seasonal": seasonal, "croston": croston})
-# {"seasonal": {"mase": 1.0, ...}, "naive": {"mase": 31.7, "beats_benchmark": False}}
+`python examples/compare_models.py` runs `compare()` on the example file's total
+(156 weeks, horizon 4, period 52) and prints, verbatim:
+
+```
+{
+ "seasonal": {"mase": 0.709, "relative_mae": 1.0, "beats_benchmark": false},
+ "holt_winters": {"mase": 0.635, "relative_mae": 0.851, "beats_benchmark": true},
+ "naive": {"mase": 0.786, "relative_mae": 1.004, "beats_benchmark": false},
+ "croston": {"mase": 1.594, "relative_mae": 2.077, "beats_benchmark": false}
+}
 ```
 
-Seasonal naive scores exactly 1.0 — it *is* the denominator, so it cannot beat itself.
-That is the line any model has to come in under.
+Seasonal naive's
+`relative_mae` is exactly 1.0: it *is* the benchmark, so it cannot beat itself. That is
+the line any model has to come in under; here only Holt-Winters does, and Croston,
+built for intermittent demand, is twice as bad on a smooth seasonal series.
+
+## Short histories
+
+Below `MIN_HISTORY = 4` points no smoothing model has anything to fit, and every
+"forecast" is the last value repeated. `forecast` refuses a file with fewer than 4
+periods (exit 2; `--allow-short` forces it) and prints a `warning:` line to stderr for
+each node that launched fewer than 4 periods ago or has under two seasons of
+`--period` (the JSON carries the same text under `"warnings"`). In Python, `ets()`
+raises a `ShortHistoryWarning` below 4 points and `history_warning(series, period=)`
+returns the reason a series is too short, or `None`.
 
 ## Usage
 
@@ -160,7 +179,7 @@ rolling_origin(history["lahore"], croston, horizon=4, period=52).summary()
 
 ## Tests
 
-**77 tests. No dependencies, no fixtures, no data download.**
+**83 tests. No dependencies, no fixtures, no data download.**
 
 | Covered | |
 |---|---|
@@ -204,7 +223,7 @@ git clone https://github.com/hammasbuilds/demand-forecast-platform
 cd demand-forecast-platform
 
 pip install -e ".[dev]"  # zero runtime dependencies; pytest for development
-pytest -q                # 77 tests, under a second
+pytest -q                # 83 tests, a few seconds
 ```
 
 Every call below is real and runs as shown:
