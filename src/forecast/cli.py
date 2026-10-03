@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Any
@@ -22,9 +23,12 @@ from .backtest import BacktestError, Forecaster, backtest_reconciliation, rollin
 from .hierarchy import METHODS, HierarchyError, reconcile
 from .io import DataError, read_csv
 from .models import (
+    MIN_HISTORY,
+    ShortHistoryWarning,
     croston,
     drift,
     ets,
+    history_warning,
     holt,
     holt_winters,
     moving_average,
@@ -88,6 +92,22 @@ def _data_note(ds) -> dict[str, Any]:
     }
 
 
+def _short_history(ds, args: argparse.Namespace) -> dict[str, str]:
+    """Refuse a file too short to fit anything; return per-node warnings otherwise."""
+    n = len(ds.periods)
+    if n < MIN_HISTORY and not args.allow_short:
+        raise ValueError(
+            f"only {n} period(s) of history; at least {MIN_HISTORY} are needed for a "
+            "forecast to be more than the last value repeated (--allow-short to force it)"
+        )
+    notes = {}
+    for node in ds.hierarchy.nodes:
+        msg = history_warning(ds.history[node], period=args.period)
+        if msg:
+            notes[node] = msg
+    return notes
+
+
 def _round(x: Any) -> Any:
     if isinstance(x, float):
         return round(x, 4)
@@ -135,7 +155,11 @@ def cmd_forecast(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown model {args.model!r}; choose from {', '.join(MODELS)}")
     fn = MODELS[args.model][1](args.period)
     h = ds.hierarchy
-    base = {node: fn(ds.history[node], args.horizon) for node in h.nodes}
+    notes = _short_history(ds, args)
+    with warnings.catch_warnings():
+        # Reported once per node through `notes`; the library warning would repeat it.
+        warnings.simplefilter("ignore", ShortHistoryWarning)
+        base = {node: fn(ds.history[node], args.horizon) for node in h.nodes}
     if len(h.nodes) == 1:
         reconciled, method = base, "none (single series)"
     else:
@@ -147,6 +171,7 @@ def cmd_forecast(args: argparse.Namespace) -> dict[str, Any]:
         "model": args.model,
         "method": method,
         "horizon": args.horizon,
+        "warnings": notes,
         "base_coherent": h.is_coherent(base),
         "coherent": h.is_coherent(reconciled),
         "forecast": _round(reconciled),
@@ -200,6 +225,11 @@ def _print_data(d: dict[str, Any]) -> None:
         f"{d['rows']} rows, {d['periods']} periods ({d['first_period']} .. {d['last_period']}), "
         f"{d['nodes']} nodes; {d['filled_with_zero']} missing cells filled with 0"
     )
+    if d["duplicate_rows_summed"]:
+        print(
+            f"note: {d['duplicate_rows_summed']} rows shared a (levels, period) key and were "
+            "summed; pass every hierarchy column in --levels if that is wrong"
+        )
 
 
 def _print_backtest(out: dict[str, Any]) -> None:
@@ -236,6 +266,8 @@ def _print_backtest(out: dict[str, Any]) -> None:
 
 def _print_forecast(out: dict[str, Any]) -> None:
     _print_data(out["data"])
+    for node, msg in out["warnings"].items():
+        print(f"warning: {node}: {msg}", file=sys.stderr)
     print(
         f"model {out['model']}, reconciled with {out['method']}; "
         f"base coherent: {out['base_coherent']}, reconciled coherent: {out['coherent']}"
@@ -286,6 +318,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="mint_wls",
         choices=METHODS,
         help="reconciliation method (default mint_wls)",
+    )
+    fc.add_argument(
+        "--allow-short",
+        action="store_true",
+        help=f"forecast even with fewer than {MIN_HISTORY} periods of history",
     )
     ev = sub.add_parser("evaluate", help="backtest every reconciliation method")
     common(ev)

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import warnings
 from collections.abc import Sequence
 from numbers import Real
 
@@ -82,6 +83,37 @@ def _check_unit(name: str, value: float | None, *, allow_zero: bool = False) -> 
     if not (isinstance(value, Real) and low_ok and value <= 1):
         bound = "0 <=" if allow_zero else "0 <"
         raise ValueError(f"{name} must satisfy {bound} {name} <= 1, got {value!r}")
+
+
+# Fewer points than this and no smoothing model has anything to fit: the forecast is
+# the last value repeated, whatever the model is called. The CLI refuses a file with
+# fewer periods than this (``--allow-short`` overrides) and warns per node below it.
+MIN_HISTORY = 4
+
+
+class ShortHistoryWarning(UserWarning):
+    """The history is too short for the forecast to be more than a guess."""
+
+
+def history_warning(history: Sequence[float], *, period: int = 1) -> str | None:
+    """Return why `history` is too short to trust a forecast from, or None.
+
+    Counts points after launch (leading zeros dropped, as the smoothing models do).
+    Below `MIN_HISTORY` points nothing is fitted; below one season (`period`) the
+    seasonal pattern cannot be estimated and `ets` silently falls back to a
+    non-seasonal model.
+    """
+    y = _launched(clean_series(history))
+    if not y:
+        return "no non-zero history; every model forecasts 0"
+    if len(y) < MIN_HISTORY:
+        return (
+            f"only {len(y)} point(s) since the first sale (minimum {MIN_HISTORY}); "
+            "the forecast is the last value repeated, not a fitted model"
+        )
+    if period > 1 and len(y) < 2 * period:
+        return f"{len(y)} points is under two seasons of {period}; no seasonality is modelled"
+    return None
 
 
 # --- baselines ----------------------------------------------------------------------
@@ -362,6 +394,13 @@ def ets(
     check_horizon(horizon)
     _check_period(period)
     y = _launched(clean_series(history))
+    if 0 < len(y) < MIN_HISTORY:
+        warnings.warn(
+            f"ets: {len(y)} point(s) of history (minimum {MIN_HISTORY}); "
+            "forecast is the last value repeated",
+            ShortHistoryWarning,
+            stacklevel=2,
+        )
     if seasonal is None:
         seasonal = period > 1 and len(y) >= 2 * period
     if seasonal:

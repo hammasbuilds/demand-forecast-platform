@@ -301,3 +301,18 @@ class TestBacktest:
             initial=12,
         )
         assert scores["a"]["folds"] == scores["b"]["folds"]
+
+
+def test_ets_warns_on_short_history_and_helper_explains():
+    import warnings
+
+    from forecast.models import ShortHistoryWarning, ets, history_warning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert ets([10.0], 2, period=52) == [10.0, 10.0]
+    assert any(issubclass(w.category, ShortHistoryWarning) for w in caught)
+    assert "minimum 4" in history_warning([0, 0, 10.0])
+    assert history_warning([0, 0]).startswith("no non-zero")
+    assert history_warning([1.0] * 10, period=52).endswith("no seasonality is modelled")
+    assert history_warning([1.0] * 10) is None

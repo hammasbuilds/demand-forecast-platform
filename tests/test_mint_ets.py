@@ -144,7 +144,8 @@ class TestETSFamily:
         assert max(out) - min(out) > 5.0
 
     def test_ets_with_no_seasonality_and_short_history_does_not_crash(self):
-        out = ets([3.0, 4.0, 5.0], horizon=2)
+        with pytest.warns(UserWarning, match="minimum 4"):
+            out = ets([3.0, 4.0, 5.0], horizon=2)
         assert len(out) == 2
 
     def test_ets_period_must_be_at_least_1(self):

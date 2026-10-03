@@ -202,3 +202,40 @@ class TestVersion:
         with pytest.raises(SystemExit) as exc:
             main(["--version"])
         assert exc.value.code == 0
+
+
+def _fc(path, *extra):
+    return main(["forecast", str(path), "--time", "week", "--value", "sales", *extra])
+
+
+class TestShortHistory:
+    def test_one_row_is_refused(self, tmp_path, capsys):
+        path = tmp_path / "one.csv"
+        path.write_text("week,sales\n2024-01-01,10\n", encoding="utf-8")
+        assert _fc(path, "--period", "52") == 2
+        assert "only 1 period" in capsys.readouterr().err
+
+    def test_allow_short_forecasts_with_warning(self, tmp_path, capsys):
+        path = tmp_path / "one.csv"
+        path.write_text("week,sales\n2024-01-01,10\n", encoding="utf-8")
+        assert _fc(path, "--period", "52", "--allow-short", "--json") == 0
+        out = json.loads(capsys.readouterr().out)
+        assert "minimum 4" in out["warnings"]["total"]
+
+    def test_under_two_seasons_warns_on_stderr(self, sales_csv, capsys):
+        assert _fc(sales_csv, "--levels", "region", "--period", "52") == 0
+        err = capsys.readouterr().err
+        assert "warning: total:" in err and "two seasons of 52" in err
+
+    def test_enough_history_has_no_warning(self, sales_csv, capsys):
+        assert _fc(sales_csv, "--levels", "region", "--json") == 0
+        assert json.loads(capsys.readouterr().out)["warnings"] == {}
+
+
+def test_backtest_text_reports_summed_duplicates(sales_csv, capsys):
+    # Only --levels region: the two stores per region collapse, so rows are summed.
+    path = sales_csv.parent / "dup.csv"
+    path.write_text(CSV + "north,lahore,2024-01-01,5\n", encoding="utf-8")
+    code = main(["backtest", str(path), "--time", "week", "--value", "sales"])
+    assert code == 0
+    assert "rows shared a (levels, period) key and were summed" in capsys.readouterr().out
